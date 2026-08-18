@@ -80,27 +80,3 @@ its own terms, not just "that's what was there":
   needed zero changes to carry the linkage durably — the tradeoff is that
   `orders` now has two nullable-ish columns that are meaningless for a
   standalone order.
-
-## Known gaps and honest limitations
-
-See the README's "Known gaps" section for the full list (no migration
-tracking table, no feed auto-reconnect, no auth on the REST or WebSocket
-endpoints, no partial fills). None of these were AI oversights discovered
-too late to fix — they were scoped out deliberately, given the assignment's
-timebox, and are called out explicitly rather than silently.
-
-## What a reviewer should press on
-
-- The three-case branch in `internal/instrument/ledger.go`'s `ApplyFill`
-  (same-direction / partial-close / flip) — ask for the arithmetic to be
-  walked through by hand for a flip case, since that's the one most likely
-  to have a sign error hiding in it.
-- Why `activateChildrenOf` and `cancelSiblingOf`
-  (`internal/instrument/bracket.go`) are called from inside `fillOrder`
-  rather than as a separate message type — the answer is atomicity with
-  respect to the actor's single-writer channel, but it's worth confirming
-  that reasoning holds up under questioning.
-- Why `lastLTP`/`hasLTP` are explicitly *not* restored from persistence on
-  restart (`internal/instrument/actor_state.go`'s `restore`) — this was a
-  deliberate choice to trust the first live tick after a restart over a
-  possibly-stale pre-crash price, but it's a choice, not the only option.
