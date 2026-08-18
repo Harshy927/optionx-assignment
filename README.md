@@ -1,100 +1,210 @@
-# OptionX Backend Assignment — Position Engine
+# OptionX Position Engine
 
-Build a small position engine on a live tick feed.
+A small position engine that ingests a live tick feed, aggregates 1-minute OHLC
+candles, matches market/limit/bracket orders against the feed, maintains a
+per-instrument position ledger, and streams position/P&L updates over
+WebSocket. Built for the OptionX backend assignment.
 
-OptionX builds a real-time options trading terminal for Indian F&O markets. Our backend
-(Go, MongoDB, Redis, WebSockets) sits between live market data and real money: it ingests
-ticks, holds resting orders, computes live P&L, and streams it all back to traders. This
-assignment is a miniature of that exact system. Nothing in it is artificial — every
-requirement maps to a problem our production engine handles today, and a couple of them
-map to bugs we have actually shipped and fixed.
+## Running it
 
-**Expected effort:** ~6 focused hours over 3–4 days.
-**Language:** Go for the core service (helper scripts in anything you like).
+### Prerequisites
 
-## The tick feed (provided)
+- Go 1.22+ (developed against 1.26)
+- PostgreSQL running locally, reachable with no password (see
+  [Database substitution](#database-mongodb--postgresql) below)
 
-`tickgen/` in this repo streams newline-delimited JSON ticks over TCP for 20 option
-instruments. Rates are deliberately bursty — a calm few seconds, then bursts of several
-hundred ticks per second.
+### 1. Create the database
+
+```bash
+createdb optionx
+```
+
+The server applies its own migrations on startup (`migrations/*.sql`, run in
+filename order), so no separate migration step is needed.
+
+### 2. Start the tick feed
 
 ```bash
 cd tickgen
-go run . -addr :9001          # serve the stream
-nc localhost 9001 | head      # peek at it
+go run . -addr :9001
 ```
 
-Each tick looks like:
+### 3. Start the server
 
-```json
-{"seq": 184223, "token": "NIFTY26AUG24800CE", "ltp": 132.55, "ts": 1755500000123}
+```bash
+go run ./cmd/server
 ```
 
-- `seq` is monotonically increasing **per instrument**.
-- The stream is **deterministic per seed**: restarting `tickgen` with the same `-seed`
-  (default 42) replays the identical tick content. `-from N` starts the stream at global
-  event N, so you can replay history your engine has already seen. **Your engine must
-  cope with seeing the same tick twice.**
+Environment variables (all optional, sensible localhost defaults):
 
-## What you'll build
+| Variable               | Default     | Purpose                          |
+|-------------------------|-------------|-----------------------------------|
+| `OPTIONX_DB_HOST`       | `localhost` | Postgres host                     |
+| `OPTIONX_DB_USER`       | `$USER`     | Postgres user                     |
+| `OPTIONX_DB_PASSWORD`   | *(empty)*   | Postgres password                 |
+| `OPTIONX_DB_NAME`       | `optionx`   | Database name                     |
+| `OPTIONX_DB_SSLMODE`    | `disable`   | Postgres SSL mode                 |
+| `OPTIONX_HTTP_ADDR`     | `:8080`     | HTTP/WebSocket listen address     |
+| `OPTIONX_FEED_ADDR`     | `localhost:9001` | tickgen address              |
 
-One Go service, three milestones.
+The server connects to Postgres, applies migrations, seeds every instrument's
+candle aggregator and order/position state from whatever was persisted by a
+previous run, then connects to the tick feed and starts serving.
 
-### 1. Ingest & aggregate
+### 4. Exercise the API
 
-- Consume the feed; maintain in-memory last price per instrument.
-- Aggregate ticks into 1-minute OHLC candles and persist them (MongoDB preferred; if you
-  use PostgreSQL instead, add a short note on what you'd change for Mongo).
-- A replayed tick (same `seq`) must never distort a candle.
+```bash
+# Place a market order (fills immediately at the last known price)
+curl -X POST localhost:8080/orders -H "Content-Type: application/json" -d \
+  '{"token":"NIFTY26AUG24800CE","side":"buy","type":"market","qty":10}'
 
-### 2. Orders & positions
+# Place a limit order (rests until a tick crosses the limit price)
+curl -X POST localhost:8080/orders -H "Content-Type: application/json" -d \
+  '{"token":"NIFTY26AUG24800CE","side":"buy","type":"limit","qty":10,"limit_price":100.0}'
 
-- REST API: place and cancel orders — **market** (fills at last price immediately) and
-  **limit** (rests; fills when a tick crosses its price).
-- Maintain a position ledger per instrument: quantity, average price, realized and
-  unrealized P&L updating off the feed.
-- Orders and positions must survive a process restart: resting orders keep resting, and
-  a restart + feed replay must not double-fill anything.
+# Place a bracket order (entry + take-profit + stop-loss, OCO)
+curl -X POST localhost:8080/orders/bracket -H "Content-Type: application/json" -d \
+  '{"token":"NIFTY26AUG24800CE","side":"buy","qty":10,"entry_type":"market",
+    "target_price":260.0,"stop_price":245.0}'
 
-### 3. Stream it back
+# Cancel an order (by ID, from any of the above responses)
+curl -X DELETE localhost:8080/orders/<order-id>
 
-- A WebSocket endpoint where a client subscribes to instruments and receives position +
-  P&L updates.
-- Throttle to at most one update per instrument per 100 ms per client.
-- A slow or stalled client must not slow the tick loop or other clients — decide your
-  backpressure policy and write it down.
+# Check a position
+curl localhost:8080/positions/NIFTY26AUG24800CE
 
-## The part we grade hardest
+# Health check
+curl localhost:8080/health
+```
 
-Two scenarios, both taken from our production history — **write tests for both**:
+WebSocket streaming:
 
-1. **Cancel vs. trigger race.** A cancel request arrives in the same instant a tick
-   crosses a resting limit order. Exactly one outcome must win, and the API caller and
-   the ledger must agree on which one it was.
-2. **Restart under replay.** Kill the process mid-burst, restart it, replay the feed from
-   an earlier `seq`. No duplicate fills, no distorted candles, no phantom positions.
+```bash
+# any WebSocket client; wscat/websocat both work, e.g.:
+websocat ws://localhost:8080/ws
+# then, to filter to specific instruments, send a control message:
+{"action":"subscribe","tokens":["NIFTY26AUG24800CE"]}
+```
 
-## Stretch goal — optional, pick at most one
+A client that never sends a subscribe message receives updates for every
+instrument (no filter) — convenient for a quick manual check.
 
-- **Bracket orders:** an entry with attached stop-loss and target children; when one
-  child fills, the other cancels (OCO). The cancel-race rules above apply to the pair.
-- **Risk check:** a per-instrument max-position limit that rejects violating orders —
-  correctly, even under concurrent order placement.
+### 5. Run the tests
 
-## Ground rules
+```bash
+go test ./... -race
+```
 
-- **AI tools are allowed and encouraged** — we use them heavily ourselves. Keep a
-  `NOTES.md` logging where AI wrote code and what you had to correct or reject. In the
-  follow-up interview we'll pick lines from your code at random and ask you to defend
-  them; "the AI wrote that" is a fine origin story and a failing explanation.
-- **Timebox honestly.** ~6 focused hours. If milestone 3 is partial, a clear note on
-  what's missing and how you'd finish beats a rushed implementation. We're hiring
-  judgment, not stamina.
-- **No UI.** `curl` examples or a tiny script exercising the API are enough.
+Requires the same local Postgres instance (storage-package tests are
+integration tests against a real database, not mocks — see
+[Testing approach](#testing-approach)).
 
-## What to submit
+The two explicitly graded scenarios each have dedicated tests:
 
-- A repo (or zip) with the service, tests for the two graded scenarios, and a `README`:
-  how to run it, your design decisions (especially the backpressure and idempotency
-  choices), and known gaps.
-- `NOTES.md` — the AI log plus anything you'd flag to a reviewer.
+- **Cancel vs. trigger race:** `internal/instrument/actor_test.go`
+  (`TestActor_CancelVsTrigger_Race_SingleDeterministicWinner`) and its bracket
+  extension in `internal/instrument/bracket_test.go`
+  (`TestActor_BracketCancelVsTrigger_Race_SingleDeterministicWinner`). Each
+  runs 200 concurrent trials; run repeatedly under the race detector with:
+  ```bash
+  go test ./internal/instrument/... -race -count=50 -run CancelVsTrigger
+  ```
+- **Restart under replay:** `internal/storage/restart_recovery_test.go`
+  (`TestRestartUnderReplay_RestingOrder_FillsExactlyOnce` and
+  `TestRestartUnderReplay_AlreadyFilledOrder_NeverRefills`), plus the candle
+  analog in `internal/storage/candle_store_test.go`
+  (`TestApplyTick_RestartAndReplay_NoDoubleCount`).
+
+## Design decisions
+
+### Database: MongoDB → PostgreSQL
+
+The assignment prefers MongoDB; this implementation uses PostgreSQL instead.
+What would change to move to Mongo:
+
+- The seq-watermark check-and-bump (idempotency) and the order/position write
+  (durability) currently rely on Postgres transactions
+  (`internal/storage/candle_store.go`'s `ApplyTick`,
+  `internal/storage/order_store.go`'s `SaveFillTransition`) to make two writes
+  atomic. Mongo would need either a multi-document transaction (available on
+  replica sets) or a redesign around single-document atomic updates (e.g.
+  storing watermark + candle in one document per instrument, or using
+  `findAndModify` with an optimistic version field).
+- `sqlx` scanning/`db:` tags (`internal/storage/*_store.go`) would become BSON
+  struct tags and the Mongo Go driver's API.
+- Migrations (`migrations/*.sql`) would become index-creation calls, since
+  Mongo has no schema to migrate.
+- The core domain logic (`internal/order`, `internal/instrument`,
+  `internal/candle`) is untouched by this choice — it has no database
+  dependency at all, by design.
+
+### Idempotency: seq watermark
+
+Every instrument has a persisted `last_seq` (`instrument_seq_watermark`
+table). A tick is applied only if `tick.seq > last_seq`; the check and the
+resulting write happen in the same transaction, so a crash between them is
+never observable — either both happened or neither did. This is sufficient
+because the feed only ever replays from an earlier point (never reorders), so
+a simple watermark, not a full dedup log, is the right amount of mechanism.
+
+Orders use a related but distinct guard: an order's `status` column is
+itself idempotent — once `filled` or `cancelled`, `handleTick` only ever
+re-evaluates orders still `resting`, so a replayed tick can re-observe an
+already-filled order without re-filling it. See
+`internal/instrument/actor_state.go`.
+
+### Concurrency: one actor goroutine per instrument
+
+Each instrument's resting orders and position ledger are owned exclusively
+by a single goroutine (`internal/instrument/actor.go`). Every mutation —
+ticks, order placement, cancellation — arrives as a message on that
+goroutine's channel and is processed to completion before the next message
+is read. This is what makes the cancel-vs-trigger race deterministic: a
+cancel and a crossing tick for the same order can never be evaluated
+concurrently, because only one can ever be "next" in the channel, and the
+loser is told the truth (`already_filled` or the cancel simply wins) rather
+than a guess.
+
+This was chosen over per-row database locking because ticks arrive in
+bursts of several hundred per second; a DB round-trip per tick just to check
+for a crossing order would not keep up. The actor model resolves the race
+entirely in memory and only touches Postgres to persist the outcome
+afterward (write-through, not write-first).
+
+### Backpressure: per-client coalescing, not queuing or disconnecting
+
+The WebSocket hub (`internal/ws`) gives each client a buffer of "latest
+update per instrument." Publishing into it is always non-blocking: a newer
+update for an instrument overwrites the older one rather than queuing. A
+100ms ticker flushes the buffer to the socket. Consequences:
+
+- The tick loop never blocks on a slow client — `Hub.Publish` only ever does
+  a map write, never I/O.
+- A stalled client is never disconnected, either — it just sees stale-then-
+  current state once it catches up, rather than a backlog of every value it
+  missed. This fits a position/P&L feed: a viewer cares what's true *now*,
+  not the full history of every intermediate tick.
+
+Tested with two real WebSocket clients — one deliberately never reading —
+in `internal/ws/handler_test.go`.
+
+### Fill price
+
+Both market and limit orders fill at the observed LTP of the tick that made
+them marketable, not at the order's limit price. A limit price is a
+worst-acceptable-price bound, not a promised execution price; filling at the
+limit price itself would fabricate a price the market never actually traded
+at. See `internal/order/order.go`'s `FillPrice`.
+
+
+
+## Stretch goal: bracket (OCO) orders
+
+`POST /orders/bracket` accepts an entry plus target (take-profit, a limit
+order) and stop (stop-loss, a new `Stop` order type that triggers in the
+opposite direction from a limit at the same side) on the opposite side of
+the entry. Both children are validated and stored atomically with the
+entry; when either fills, the other is cancelled in the same
+message-processing step that filled it (`internal/instrument/bracket.go`),
+so the same cancel-race guarantees proven for a single order extend to the
+pair — see `TestActor_BracketCancelVsTrigger_Race_SingleDeterministicWinner`.
