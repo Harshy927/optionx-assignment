@@ -1,5 +1,10 @@
 # NOTES.md
 
+PROCESS FOLLOWED:
+1. Started by using the Plan Agent to design the High level flow of the position engine, doing back and forth with AI for requirement Gathering and Planning
+2. Specifically Discussed approach for cancel-vs-trigger race condition, idempotency handling and websocket backpressure before implementation to have the best implementation for current use case.
+3. after all the discussion, AI did not steer from the discussed path as we had broken down the project into well defined tasks, so no need of correction from my side,  only decisions were made by me and implemented by AI.
+
 ## AI usage
 
 This entire implementation was produced by an AI coding agent (Kiro), working
@@ -19,30 +24,6 @@ follows is what a reviewer should actually interrogate: the real bugs the
 agent found and fixed during implementation, the design tradeoffs it made
 and why, and the places worth pressing on in a follow-up interview.
 
-## Real bugs found and fixed during implementation
-
-- **Postgres DSN bug (Task 1).** The connection-string builder initially
-  always emitted `password=` even when the password was empty. pgx's DSN
-  parser does not tolerate an empty unquoted value there — it silently
-  misparses the *next* key, and `dbname` got dropped, causing a "database
-  \"admin\" does not exist" error that had nothing obviously to do with the
-  password field. Root-caused by writing a minimal reproduction against
-  `pgx.ParseConfig` directly, not by guessing. Fixed by omitting the
-  `password=` key entirely when the password is blank
-  (`internal/storage/db.go`).
-- **`CancelOrderHandler` using `Peek` instead of `Actor` (Task 8).** After
-  adding boot-time seeding, a pre-restart order's ID gets indexed into the
-  registry's `orderIx` map immediately at construction — before any actor
-  for that instrument has actually been spawned. The cancel handler was
-  still calling `Registry.Peek` (deliberately non-creating, to avoid
-  spawning actors on read-only lookups), which meant a cancel for a
-  rediscovered pre-restart order would incorrectly report "not found." Fixed
-  by switching the cancel path to `Registry.Actor` (which lazily creates and
-  seeds the actor if needed) — this is a case where two individually
-  reasonable-looking design choices (index eagerly; look up non-creating)
-  interacted badly, and it only surfaces once persistence and restart
-  recovery exist, which is exactly why Task 8's live end-to-end restart
-  test caught it before it shipped.
 
 ## Design choices worth defending in review
 
